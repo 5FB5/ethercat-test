@@ -1,4 +1,7 @@
 #include <iostream>
+#include <vector>
+#include <memory.h>
+#include <inttypes.h>
 #include "ethercat.h"
 
 #define OTYPE_VAR               0x0007
@@ -11,6 +14,18 @@
 #define ATYPE_Wpre              0x08
 #define ATYPE_Wsafe             0x10
 #define ATYPE_Wop               0x20
+
+ec_ODlistt objectDescriptionList;
+ec_OElistt objectEntryInformationList;
+
+char *ioMap = nullptr;
+
+struct currentPdoSubindexInfo
+{
+    uint8_t subindex;
+    std::string name;
+    std::string type;
+};
 
 char* otype2string(uint16 otype)
 {
@@ -133,9 +148,6 @@ void printObjectDescription(uint16_t slave)
     std::cout << std::endl;
     std::cout << "Object dictionary for slave: " << slave << " [" << ec_slave[slave].name << "]" << std::endl;
 
-    ec_ODlistt objectDescriptionList;
-    ec_OElistt objectEntryInformationList;
-
     objectDescriptionList.Entries = 0;
 
     if (!ec_readODlist(slave, &objectDescriptionList))
@@ -172,12 +184,340 @@ void printObjectDescription(uint16_t slave)
             maxSubindexes = objectDescriptionList.MaxSub[i];
         }
 
-        for (int j = 0; j < maxSubindexes; j++)
+        for (int j = 0; j <= maxSubindexes; j++)
         {
             std::cout << "\t" << j << ": " << objectEntryInformationList.Name[j] <<
                     " [" << dtype2string(objectEntryInformationList.DataType[j], objectEntryInformationList.BitLength[j]) << "] = "
                       << " [" << access2string(objectEntryInformationList.ObjAccess[j]) << "] " << std::endl;
         }
+
+        std::cout << std::endl;
+    }
+}
+
+int readInputPdoMapping(uint16_t slave, uint16_t pdoAssign)
+{
+    uint16_t pdo_number = 0;    // Число PDO объектов
+    uint16_t pdo_cnt = 0;
+    uint32_t pdo_data = 0;
+    uint16_t current_io_addr = 0;   // Используется для отображения PDO_description в iomap
+    uint8_t bitlen = 0;
+
+    int bsize = 0;
+    int wkc = 0;
+
+    int data_size = sizeof(pdo_number);
+
+    // Получаем число PDO объектов с нулевого сабиндекса
+    wkc = ec_SDOread(slave, pdoAssign, 0x00, FALSE, &data_size, &pdo_number, EC_TIMEOUTRXM);
+    pdo_number = etohs(pdo_number); // Конвертация в зависимости от платформы
+
+    if (wkc <= 0 || pdo_number <= 0)
+    {
+        std::cout << "Can't get TxPDO mapping (wkc:" << wkc << ", pdo_number:" << pdo_number << ")" << std::endl;
+        return -1;
+    }
+
+    for (int pdoCnt = 1; pdoCnt <= pdo_number; pdoCnt++)
+    {
+        uint16_t currentIndex = 0;
+
+        data_size = sizeof(pdo_number);
+
+        wkc = ec_SDOread(slave, pdoAssign, (uint8_t)pdoCnt, FALSE, &data_size, &currentIndex, EC_TIMEOUTRXM);
+
+        currentIndex = etohs(currentIndex);
+
+        if (currentIndex <= 0)
+        {
+            std::cout << "Can't get PDO from index" << currentIndex << std::endl;
+            return -1;
+        }
+
+        std::vector<currentPdoSubindexInfo> subindexesList;
+
+        std::cout << std::endl;
+        std::cout << "PDO index: 0x" << std::hex << currentIndex << std::endl;
+
+        uint8_t subindexNumber = 0;
+
+        data_size = sizeof(subindexNumber);
+
+        std::cout << std::endl;
+        std::cout << "Reading PDO subindex count..." << std::endl;
+
+        wkc = ec_SDOread(slave, currentIndex, 0x00, FALSE, &data_size, &subindexNumber, EC_TIMEOUTRXM);
+
+        if (wkc <= 0)
+        {
+            std::cout << "Bad read (wkc:" << wkc << ")" << std::endl;
+            return -1;
+        }
+
+        std::cout << "Good read (wkc: " << wkc << ")" << std::endl;
+        std::cout << std::endl;
+
+        data_size = sizeof(pdo_data);
+
+        for (int iSubidx = 1; iSubidx <= subindexNumber; iSubidx++)
+        {
+            ec_SDOread(slave, currentIndex, iSubidx, FALSE, &data_size, &pdo_data, EC_TIMEOUTRXM);
+
+            uint16_t index = (uint16_t) (pdo_data >> 16);
+            uint8_t subindex = (uint8_t) ( (pdo_data >> 8) & 0x000000ff);
+            uint8_t size = (pdo_data & 0x000000ff) / 8;
+
+            bitlen = LO_BYTE(pdo_data);
+            bsize += bitlen;
+
+            objectDescriptionList.Slave = slave;
+            objectDescriptionList.Index[0] = index;
+
+            objectEntryInformationList.Entries = 0;
+
+            if (index || subindex)
+            {
+                std::cout << "Reading OE info..." << std::endl;
+                wkc = ec_readOEsingle(0, subindex, &objectDescriptionList, &objectEntryInformationList);
+            }
+
+            if (wkc <= 0)
+            {
+                std::cout << "Can't read OE (wkc: " << wkc << ")" << std::endl;
+                return -1;
+            }
+
+            if (objectEntryInformationList.Entries == 0)
+            {
+                std::cout << "No entries in OE list" << std::endl;
+                return -1;
+            }
+
+            std::cout << "Good read (wkc: " << wkc << ")" << std::endl;
+            std::cout << std::endl;
+
+            currentPdoSubindexInfo newInfo;
+
+            newInfo.subindex = subindex;
+            newInfo.name = objectEntryInformationList.Name[subindex];
+            newInfo.type = dtype2string(objectEntryInformationList.DataType[subindex], bitlen);
+
+            subindexesList.push_back(newInfo);
+        }
+
+        std::cout << std::endl;
+
+        std::cout << "0x" << std::hex << currentIndex << std::endl;
+
+        for (const auto &it : subindexesList)
+        {
+            std::cout << "\t" << static_cast<unsigned>(it.subindex) << ": " << it.name << " " << it.type << std::endl;
+        }
+    }
+
+    return bsize;
+}
+
+int readOutputPdoMapping(uint16_t slave, uint16_t pdoAssign)
+{
+    uint16_t pdo_number = 0;    // Число PDO объектов
+    uint16_t pdo_cnt = 0;
+    uint32_t pdo_data = 0;
+    uint16_t current_io_addr = 0;   // Используется для отображения PDO_description в iomap
+    uint8_t bitlen = 0;
+
+    int bsize = 0;
+    int wkc = 0;
+
+    int data_size = sizeof(pdo_number);
+
+    // Получаем число PDO объектов с нулевого сабиндекса
+    wkc = ec_SDOread(slave, pdoAssign, 0x00, FALSE, &data_size, &pdo_number, EC_TIMEOUTRXM);
+    pdo_number = etohs(pdo_number); // Конвертация в зависимости от платформы
+
+    if (wkc <= 0 || pdo_number <= 0)
+    {
+        std::cout << "Can't get RxPDO mapping (wkc:" << wkc << ", pdo_number:" << pdo_number << ")" << std::endl;
+        return -1;
+    }
+
+    for (int pdoCnt = 1; pdoCnt <= pdo_number; pdoCnt++)
+    {
+        uint16_t currentIndex = 0;
+
+        data_size = sizeof(pdo_number);
+
+        wkc = ec_SDOread(slave, pdoAssign, (uint8_t)pdoCnt, FALSE, &data_size, &currentIndex, EC_TIMEOUTRXM);
+
+        currentIndex = etohs(currentIndex);
+
+        if (currentIndex <= 0)
+        {
+            std::cout << "Can't get PDO from index" << currentIndex << std::endl;
+            return -1;
+        }
+
+        std::vector<currentPdoSubindexInfo> subindexesList;
+
+        std::cout << std::endl;
+        std::cout << "PDO index: 0x" << std::hex << currentIndex << std::endl;
+
+        uint8_t subindexNumber = 0;
+
+        data_size = sizeof(subindexNumber);
+
+        std::cout << std::endl;
+        std::cout << "Reading PDO subindex count..." << std::endl;
+
+        wkc = ec_SDOread(slave, currentIndex, 0x00, FALSE, &data_size, &subindexNumber, EC_TIMEOUTRXM);
+
+        if (wkc <= 0)
+        {
+            std::cout << "Bad read (wkc:" << wkc << ")" << std::endl;
+            return -1;
+        }
+
+        std::cout << "Good read (wkc: " << wkc << ")" << std::endl;
+        std::cout << std::endl;
+
+        data_size = sizeof(pdo_data);
+
+        for (int iSubidx = 1; iSubidx <= subindexNumber; iSubidx++)
+        {
+            ec_SDOread(slave, currentIndex, iSubidx, FALSE, &data_size, &pdo_data, EC_TIMEOUTRXM);
+
+            uint16_t index = (uint16_t) (pdo_data >> 16);
+            uint8_t subindex = (uint8_t) ( (pdo_data >> 8) & 0x000000ff);
+            uint8_t size = (pdo_data & 0x000000ff) / 8;
+
+            bitlen = LO_BYTE(pdo_data);
+            bsize += bitlen;
+
+            objectDescriptionList.Slave = slave;
+            objectDescriptionList.Index[0] = index;
+
+            objectEntryInformationList.Entries = 0;
+
+            if (index || subindex)
+            {
+                std::cout << "Reading OE info..." << std::endl;
+                wkc = ec_readOEsingle(0, subindex, &objectDescriptionList, &objectEntryInformationList);
+            }
+
+            if (wkc <= 0)
+            {
+                std::cout << "Can't read OE (wkc: " << wkc << ")" << std::endl;
+                return -1;
+            }
+
+            if (objectEntryInformationList.Entries == 0)
+            {
+                std::cout << "No entries in OE list" << std::endl;
+                return -1;
+            }
+
+            std::cout << "Good read (wkc: " << wkc << ")" << std::endl;
+            std::cout << std::endl;
+
+            currentPdoSubindexInfo newInfo;
+
+            newInfo.subindex = subindex;
+            newInfo.name = objectEntryInformationList.Name[subindex];
+            newInfo.type = dtype2string(objectEntryInformationList.DataType[subindex], bitlen);
+
+            subindexesList.push_back(newInfo);
+        }
+
+        std::cout << std::endl;
+
+        std::cout << "0x" << std::hex << currentIndex << std::endl;
+
+        for (const auto &it : subindexesList)
+        {
+            std::cout << "\t" << static_cast<unsigned>(it.subindex) << ": " << it.name << " " << it.type << std::endl;
+        }
+    }
+
+    return bsize;
+}
+
+void printPdoMapping(uint16_t slave)
+{
+    if (ioMap == nullptr)
+    {
+        std::cout << "Can't get PDO, 'cause iomap not initialized" << std::endl;
+        return;
+    }
+
+    std::cout << std::endl;
+    std::cout << "Reading PDOs..." << std::endl;
+
+    uint8_t syncManagerNumber, currentSyncManager = 0;
+
+    int wkc = 0;
+    int syncManagerNumberSize = 0;
+    int smBugAdd = 0;
+
+    int outputsNum = 0;
+    int inputsNum = 0;
+
+    syncManagerNumberSize = sizeof(syncManagerNumber);
+
+    wkc = ec_SDOread(slave, ECT_SDO_SMCOMMTYPE, 0x00, FALSE, &syncManagerNumberSize, &syncManagerNumber, EC_TIMEOUTRXM);
+
+    if (wkc <= 0 || syncManagerNumber <= 2)
+    {
+        std::cout << "Can't start read PDO (wkc =" << wkc << ", syncManagerNumber =" << syncManagerNumber << ")" << std::endl;
+        return;
+    }
+
+    // make syncManagerNumber equal to number of defined SM
+    syncManagerNumber--;
+
+    if (syncManagerNumber > EC_MAXSM)
+        syncManagerNumber = EC_MAXSM;
+
+    for (int iSm = 2; iSm <= syncManagerNumber; iSm++)
+    {
+        syncManagerNumberSize = sizeof(currentSyncManager);
+
+        std::cout << "Reading current SM..." << std::endl;
+
+        wkc = ec_SDOread(slave, ECT_SDO_SMCOMMTYPE, iSm + 1, FALSE, &syncManagerNumberSize, &currentSyncManager, EC_TIMEOUTRXM);
+
+        if (wkc <= 0)
+        {
+            std::cout << "Bad read (wkc: " << wkc << ")" << std::endl;
+            return;
+        }
+
+        std::cout << "Good read (wkc: " << wkc << ")" << std::endl;
+
+        if ((iSm == 2) && (currentSyncManager == 2)) // SM2 has type 2 == mailbox out, this is a bug in the slave!
+        {
+            smBugAdd = 1; // try to correct, this works if the types are 0 1 2 3 and should be 1 2 3 4
+            std::cout << "Activated SM type workaround, possible incorrect mapping" << std::endl;
+        }
+
+        if (currentSyncManager)
+            currentSyncManager += smBugAdd; // only add if SMt > 0
+
+        std::cout << std::endl;
+        std::cout << "Reading SM" << static_cast<unsigned>(currentSyncManager) << " (";
+
+        if (currentSyncManager == 3) // RxPDO
+        {
+            std::cout << "RxPDO)..." << std::endl;
+            outputsNum = readOutputPdoMapping(slave, ECT_SDO_PDOASSIGN + iSm);
+        }
+        else if (currentSyncManager == 4) // TxPDO
+        {
+            std::cout << "TxPDO)..." << std::endl;
+            std::cout << "TODO: read PDO from SM4" << std::endl;
+            inputsNum = readInputPdoMapping(slave, ECT_SDO_PDOASSIGN + iSm);
+        }
+
+        std::cout << std::endl;
     }
 }
 
@@ -203,9 +543,10 @@ int main()
     }    
 
     int wkc;
-    char ioMap[4096];
 
     std::cout << "Found " << ec_slavecount << " slave(s)" << std::endl;
+
+    ioMap = new char[4096];
 
     ec_config_map(ioMap);
 
@@ -222,6 +563,7 @@ int main()
         std::cout << "\tVendorID: " << ec_slave[i].eep_id << std::endl;
         std::cout << "\tEtherCAT addr: 0x" << ec_slave[i].configadr << std::endl;
         std::cout << "\tManufacturer: 0x" << ec_slave[i].eep_man << std::endl;
+        std::cout << std::endl;
     }
 
     if (ec_slave[0].state != EC_STATE_SAFE_OP)
@@ -235,7 +577,8 @@ int main()
 
     for (int i = 1; i <= ec_slavecount; i++)
     {
-        printObjectDescription(1);
+        printObjectDescription(i);
+        printPdoMapping(i);
     }
 
     ec_close();
