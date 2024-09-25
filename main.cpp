@@ -1,6 +1,7 @@
 #include <iostream>
 #include <vector>
 #include <memory.h>
+#include <unistd.h>
 #include <inttypes.h>
 #include "ethercat.h"
 
@@ -22,10 +23,48 @@ char *ioMap = nullptr;
 
 struct currentPdoSubindexInfo
 {
-    uint8_t subindex;
+    uint32_t subindex;
     std::string name;
     std::string type;
 };
+
+struct readData_t
+{
+    int32_t posActualValue;
+    uint32_t digitalInputs;
+    uint16_t statusWord;
+} __attribute__((packed));
+
+
+struct writeData_t
+{
+    int32_t position;
+    uint32_t subindex01;
+    uint16_t controlword;
+} __attribute__((packed));
+
+struct registert
+{
+    uint8_t subindex;
+    std::string name;
+};
+
+struct record_t
+{
+    uint16_t index;
+    std::string name;
+
+    std::vector<registert> registers;
+};
+
+struct pdoMap_t
+{
+    uint16_t smIndex;
+    std::vector<record_t> records;
+};
+
+pdoMap_t pdoInput;
+pdoMap_t pdoOutput;
 
 char* otype2string(uint16 otype)
 {
@@ -146,6 +185,7 @@ char* access2string(uint16 access)
 void printObjectDescription(uint16_t slave)
 {
     std::cout << std::endl;
+    std::cout << "________________" << std::endl;
     std::cout << "Object dictionary for slave: " << slave << " [" << ec_slave[slave].name << "]" << std::endl;
 
     objectDescriptionList.Entries = 0;
@@ -156,7 +196,7 @@ void printObjectDescription(uint16_t slave)
         return;
     }
 
-    std::cout << "Found " << objectDescriptionList.Entries << " entries" << std::endl;
+    std::cout << "Found " << std::dec << objectDescriptionList.Entries << " entries" << std::endl;
 
     for (int i = 0; i < objectDescriptionList.Entries; i++)
     {
@@ -186,7 +226,7 @@ void printObjectDescription(uint16_t slave)
 
         for (int j = 0; j <= maxSubindexes; j++)
         {
-            std::cout << "\t" << j << ": " << objectEntryInformationList.Name[j] <<
+            std::cout << "\t" << std::dec << j << ": " << objectEntryInformationList.Name[j] <<
                     " [" << dtype2string(objectEntryInformationList.DataType[j], objectEntryInformationList.BitLength[j]) << "] = "
                       << " [" << access2string(objectEntryInformationList.ObjAccess[j]) << "] " << std::endl;
         }
@@ -265,6 +305,7 @@ int readInputPdoMapping(uint16_t slave, uint16_t pdoAssign)
 
             uint16_t index = (uint16_t) (pdo_data >> 16);
             uint8_t subindex = (uint8_t) ( (pdo_data >> 8) & 0x000000ff);
+
             uint8_t size = (pdo_data & 0x000000ff) / 8;
 
             bitlen = LO_BYTE(pdo_data);
@@ -298,7 +339,7 @@ int readInputPdoMapping(uint16_t slave, uint16_t pdoAssign)
 
             currentPdoSubindexInfo newInfo;
 
-            newInfo.subindex = subindex;
+            newInfo.subindex = static_cast<int>(subindex);
             newInfo.name = objectEntryInformationList.Name[subindex];
             newInfo.type = dtype2string(objectEntryInformationList.DataType[subindex], bitlen);
 
@@ -311,7 +352,7 @@ int readInputPdoMapping(uint16_t slave, uint16_t pdoAssign)
 
         for (const auto &it : subindexesList)
         {
-            std::cout << "\t" << static_cast<unsigned>(it.subindex) << ": " << it.name << " " << it.type << std::endl;
+            std::cout << "\t" << std::dec << it.subindex << ": " << it.name << " " << it.type << std::endl;
         }
     }
 
@@ -386,6 +427,8 @@ int readOutputPdoMapping(uint16_t slave, uint16_t pdoAssign)
         {
             ec_SDOread(slave, currentIndex, iSubidx, FALSE, &data_size, &pdo_data, EC_TIMEOUTRXM);
 
+            pdo_data = etohl(pdo_data);
+
             uint16_t index = (uint16_t) (pdo_data >> 16);
             uint8_t subindex = (uint8_t) ( (pdo_data >> 8) & 0x000000ff);
             uint8_t size = (pdo_data & 0x000000ff) / 8;
@@ -434,7 +477,7 @@ int readOutputPdoMapping(uint16_t slave, uint16_t pdoAssign)
 
         for (const auto &it : subindexesList)
         {
-            std::cout << "\t" << static_cast<unsigned>(it.subindex) << ": " << it.name << " " << it.type << std::endl;
+            std::cout << "\t" << std::dec << it.subindex << ": " << it.name << " " << it.type << std::endl;
         }
     }
 
@@ -450,6 +493,7 @@ void printPdoMapping(uint16_t slave)
     }
 
     std::cout << std::endl;
+    std::cout << "_____________________" << std::endl;
     std::cout << "Reading PDOs..." << std::endl;
 
     uint8_t syncManagerNumber, currentSyncManager = 0;
@@ -513,12 +557,178 @@ void printPdoMapping(uint16_t slave)
         else if (currentSyncManager == 4) // TxPDO
         {
             std::cout << "TxPDO)..." << std::endl;
-            std::cout << "TODO: read PDO from SM4" << std::endl;
             inputsNum = readInputPdoMapping(slave, ECT_SDO_PDOASSIGN + iSm);
         }
 
         std::cout << std::endl;
     }
+}
+
+/*
+ * Control word (0x6040 RxPDO)
+ * Status word (0x60401 RxPDO)
+ * Modes of operation (0x6060 RxPDO)
+ * Mode of operation display (0x6061 TxPDO)
+ * Target torque (0x6071 RxPDO)
+ * Torque actual value (0x6077 TxPDO)
+ */
+
+// PreOP to SafeOP state hook
+int po2soHook(uint16_t slave)
+{
+    std::cout << std::endl;
+    std::cout << "Set custom PDO map..." << std::endl;
+
+    // Очищаем SM
+    uint8_t pdoCounter = 0;
+    int wkc = 0;
+
+    std::cout << "\tClear input SM (0x1c13)...";
+    // Очищаем сначала Input SM
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1c13), 0x00, FALSE, sizeof(pdoCounter), &pdoCounter, EC_TIMEOUTRXM);
+
+    if (wkc <= 0)
+        std::cout << "Bad write (wkc: " << wkc << ")" << std::endl;
+    else
+        std::cout << "Good write (wkc: " << wkc << ")" << std::endl;
+
+    std::cout << "\tClear output SM (0x1c12)...";
+
+    wkc = 0;
+
+    // Очищаем Output SM
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1c12), 0x00, FALSE, sizeof(pdoCounter), &pdoCounter, EC_TIMEOUTRXM);
+
+    if (wkc <= 0)
+        std::cout << "Bad write (wkc: " << wkc << ")" << std::endl;
+    else
+        std::cout << "Good write (wkc: " << wkc << ")" << std::endl;
+
+    // RxPDO index = 1607
+    // TxPDO index = 1A07
+
+    // Очищаем текущие PDO
+
+    std::cout << "\tReset RxPDO...";
+    wkc = 0;
+
+    uint8_t clearObj = 0;
+
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 00, FALSE, sizeof(clearObj), &clearObj, EC_TIMEOUTRXM);
+
+    if (wkc == 1)
+        std::cout << "Good writing (wkc: 1)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    std::cout << "\tReset TxPDO...";
+    wkc = 0;
+
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1A07), 00, FALSE, sizeof(clearObj), &clearObj, EC_TIMEOUTRXM);
+
+    if (wkc == 1)
+        std::cout << "Good writing (wkc: 1)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    // RxPDO converted objects
+    uint32_t controlWordObj = (0x6040 << 16) | (0 << 8) | (sizeof(uint16_t) * 8);
+    uint32_t statusWordObj = (0x6041 << 16) | (0 << 8) | (sizeof(uint16_t) * 8);
+    uint32_t modesOfOpObj = (0x6060 << 16) | (0 << 8) | (sizeof(int8_t) * 8);
+    uint32_t targetTorqueObj = (0x6071 << 16) | (0 << 8) | (sizeof(int16_t) * 8);
+
+    // TxPDO converted objects
+    uint32_t modesOfOpDisplayObj = (0x6061 << 16) | (0 << 8) | (sizeof(int8_t) * 8);
+    uint32_t torqueActualValueObj = (0x6077 << 16) | (0 << 8) | (sizeof(int16_t) * 8);
+
+    // Разметка RxPDO
+    std::cout << "\tMapping RxPDO...";
+    wkc = 0;
+
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 1, FALSE, sizeof(controlWordObj), &controlWordObj, EC_TIMEOUTRXM);
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 2, FALSE, sizeof(statusWordObj), &statusWordObj, EC_TIMEOUTRXM);
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 3, FALSE, sizeof(modesOfOpObj), &modesOfOpObj, EC_TIMEOUTRXM);
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 4, FALSE, sizeof(targetTorqueObj), &targetTorqueObj, EC_TIMEOUTRXM);
+
+    if (wkc == 4)
+        std::cout << "Good writing (wkc: 4)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    // Разметка TxPDO
+    std::cout << "\tMapping RxPDO...";
+    wkc = 0;
+
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1A07), 1, FALSE, sizeof(modesOfOpDisplayObj), &modesOfOpDisplayObj, EC_TIMEOUTRXM);
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1A07), 2, FALSE, sizeof(torqueActualValueObj), &torqueActualValueObj, EC_TIMEOUTRXM);
+
+    if (wkc == 2)
+        std::cout << "Good writing (wkc: 2)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    uint8_t rxPdoContentSize = 4;
+    uint8_t txPdoContentSize = 2;
+
+    std::cout << "\tSet Rx and Tx PDOs sizes...";
+    wkc = 0;
+
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1607), 0, FALSE, sizeof(uint8_t), &rxPdoContentSize, EC_TIMEOUTRXM);
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1A07), 0, FALSE, sizeof(uint8_t), &txPdoContentSize, EC_TIMEOUTRXM);
+
+    if (wkc == 2)
+        std::cout << "Good writing (wkc: 2)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    // Настраиваем Sync Managar'ы
+
+    std::cout << "\tSet Sync Managers..." << std::endl;
+
+    // Задаём объекты PDO в SyncManager
+    std::cout << "\tSet RxPDO to SyncManager 0x1c13...";
+    wkc = 0;
+
+    uint16_t rxPdoObj = static_cast<uint16_t>(0x1607);
+    uint16_t txPdoObj = static_cast<uint16_t>(0x1A07);
+
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1c13), 1, FALSE, sizeof(uint16_t), &rxPdoObj, EC_TIMEOUTRXM);
+
+    if (wkc == 1)
+        std::cout << "Good writing (wkc: 1)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    std::cout << "\tSet TxPDO to SyncManager 0x1c12...";
+    wkc = 0;
+
+    wkc = ec_SDOwrite(slave, static_cast<uint16_t>(0x1c12), 1, FALSE, sizeof(uint16_t), &txPdoObj, EC_TIMEOUTRXM);
+
+    if (wkc == 1)
+        std::cout << "Good writing (wkc: 1)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    std::cout << "\tUpdate SyncManager's PDO counter...";
+
+    wkc = 0;
+
+    // RxPDO
+    uint8_t rxPdoCounter = 1;
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1c13), 0, FALSE, sizeof(rxPdoCounter), &rxPdoCounter, EC_TIMEOUTRXM);
+
+    // TxPDO
+    uint8_t txPdoCounter = 1;
+    wkc += ec_SDOwrite(slave, static_cast<uint16_t>(0x1c12), 0, FALSE, sizeof(txPdoCounter), &txPdoCounter, EC_TIMEOUTRXM);
+
+    if (wkc == 2)
+        std::cout << "Good writing (wkc: 2)" << std::endl;
+    else
+        std::cout << "Bad writing (wkc: " << wkc << ")" << std::endl;
+
+    std::cout << std::endl;
+
+    return 1;
 }
 
 int main()
@@ -540,18 +750,21 @@ int main()
         std::cout << "No connected slaves found" << std::endl;
         ec_close();
         return -1;
-    }    
+    }
 
     int wkc;
 
     std::cout << "Found " << ec_slavecount << " slave(s)" << std::endl;
 
-    ioMap = new char[4096];
+    // Прикрепляем коллбек при переходе из PreOP в SafeOP для маппинга PDO
+    for (int i = 1; i <= ec_slavecount; i++)
+    {
+        ec_slave[i].PO2SOconfig = po2soHook;
+    }
 
+    ioMap = new char[4096];
     ec_config_map(ioMap);
 
-    ec_slave[0].state = EC_STATE_SAFE_OP;
-    ec_writestate(0);
     ec_statecheck(0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
 
     std::cout << "Slave(s) info:" << std::endl;
@@ -569,15 +782,54 @@ int main()
     if (ec_slave[0].state != EC_STATE_SAFE_OP)
     {
         std::cout << "Not all slaves in SAFE OP" << std::endl;
+
         ec_close();
         return -1;
     }
 
     std::cout << "All slaves are in SAFE OP state" << std::endl;
 
+    // readData_t *readData = (readData_t*)ec_slave[1].inputs;
+    // writeData_t *writeData = (writeData_t*)ec_slave[1].outputs;
+
+    // std::cout << "Set slaves to OP state..." << std::endl;
+    // // Перед переводом в OP режим надо отправить пакет
+    // ec_send_processdata();
+    // ec_receive_processdata(EC_TIMEOUTRET);
+
+    // ec_slave[0].state = EC_STATE_OPERATIONAL;
+
+    // ec_writestate(0);
+
+    // ec_statecheck(0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+
+    // if (ec_slave[0].state != EC_STATE_OPERATIONAL)
+    // {
+    //     std::cout << "Not all slaves are in OP state" << std::endl;
+
+    //     ec_close();
+    //     return -1;
+    // }
+
+    // std::cout << "All slaves are in OP state" << std::endl;
+
+    // int counter = 0;
+
+    // while (counter != 15)
+    // {
+    //     sleep(1);
+
+    //     ec_send_processdata();
+    //     wkc = ec_receive_processdata(EC_TIMEOUTRET);
+
+    //     std::cout << "controlWord: " << readData->statusWord << std::endl;
+
+    //     counter++;
+    // }
+
     for (int i = 1; i <= ec_slavecount; i++)
     {
-        printObjectDescription(i);
+        // printObjectDescription(i);
         printPdoMapping(i);
     }
 
