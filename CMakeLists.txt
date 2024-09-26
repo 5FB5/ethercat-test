@@ -3,7 +3,7 @@ project(ethercat-test)
 
 add_subdirectory(libs/SOEM)
 
-set(SOURCES main.cpp)
+set(SOURCES main.cpp EthercatCOE.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
